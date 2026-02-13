@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .Python
 .idea/
+password.py
+cryptography_basics.py
+hashing_basics.py
+.vault.enc
