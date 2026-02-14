@@ -12,19 +12,18 @@ from pathlib import Path
 ROOT = Path(__file__).parent.resolve()
 VAULT = ROOT / '.vault.enc'
 
-def _dump_vault(vault_data = None):
-    if vault_data is None:
-        vault_data = {'passwords' : []}
-
-    with VAULT.open('w') as f:
-        json.dump(vault_data, f, indent=2)
-
-def _encrypt_vault(key, salt):
-    vault_string = VAULT.read_text()
+def _encrypt_vault(key:bytes, salt:bytes, vault_string: str):
     encrypted_vault = _encryptor(key, vault_string)
     with VAULT.open('wb') as f:
         f.write(salt)
         f.write(encrypted_vault)
+
+def _decrypt_vault(key:bytes) -> dict:
+    vault_bytes = VAULT.read_bytes()
+    encrypted_vault = vault_bytes[16:] # remove salt before decryption
+    decrypted_vault = _decryptor(key, encrypted_vault)
+
+    return json.loads(decrypted_vault)
 
 def _validate_password(pw: str) -> tuple[int, str]:
     result = zxcvbn(pw)
@@ -42,13 +41,13 @@ def _validate_password(pw: str) -> tuple[int, str]:
                     f'suggestions: {". ".join(suggestions)}')
     return score, response
 
-def _get_pw_hash(pw: str):
+def _get_password_hash(pw: str) -> bytes:
     return bcrypt.hashpw(pw.encode(), bcrypt.gensalt())
 
-def _verify_pw(pw_attempt: str, pw_hash: str):
+def _verify_password(pw_attempt: str, pw_hash: bytes) -> bool:
     return bcrypt.checkpw(pw_attempt.encode(), pw_hash)
 
-def _derive_key_from_pw(pw: str, salt=None) -> tuple[bytes, bytes]:
+def _derive_key_from_password(pw: str, salt=None) -> tuple[bytes, bytes]:
     if salt is None:
         salt = secrets.token_bytes(16)
 
@@ -75,6 +74,24 @@ def _decryptor(key:bytes, message:bytes) -> str:
     aes = AESGCM(key)
     return aes.decrypt(nonce, ciphertext, None).decode()
 
+def _process_master_password():
+    master_pw = getpass('Master password: ')
+    with VAULT.open('rb') as f:
+        salt = f.read(16)
+
+    key = _derive_key_from_password(master_pw, salt)[0]
+    vault = None
+    while vault is None:
+        try:
+            vault = _decrypt_vault(key)  # if password is wrong AES-GCM will raise an error
+            if 'passwords' not in vault:  #
+                raise ValueError("Vault corrupted")  # checks if files has been corrupted/tampered with, not a wrong password issue
+        except Exception:
+            master_pw = getpass("Incorrect password, try again: ")
+            key = _derive_key_from_password(master_pw, salt)[0]
+            vault = None
+    return key, salt, vault
+
 def initialize_vault(args=None):
     print('⚠️ WARNING: MASTER PASSWORD IS NOT RECOVERABLE. PLEASE WRITE IT DOWN SOMEWHERE SAFE.')
     print('IF YOU FORGET YOUR MASTER PASSWORD, YOU WILL BE LOCKED OUT OF THE PASSWORD MANAGER.')
@@ -88,19 +105,79 @@ def initialize_vault(args=None):
         print(comment)
 
     confirm = getpass('Confirm your password: ')
-    hashed = _get_pw_hash(password)
+    hashed = _get_password_hash(password)
 
-    while not _verify_pw(confirm, hashed):
+    while not _verify_password(confirm, hashed):
         confirm = getpass('Passwords do not match, please try again: ')
 
-    key, salt = _derive_key_from_pw(password)
-    _dump_vault()
-    _encrypt_vault(key, salt)
+    key, salt = _derive_key_from_password(password)
+    vault_data = {'passwords': []}
+    vault_string = json.dumps(vault_data)
+    _encrypt_vault(key, salt, vault_string)
 
     print('Your vault has been created!')
 
 def add_password(args=None):
-    pass
+    key, salt, vault = _process_master_password()
+
+    service = input('Service name: ').lower()
+    username = input('Username: ')
+    generate = input('1. Generate password\n'
+                     '2. Enter password\n'
+                     '(1 or 2): ')
+    while generate not in ('1', '2'):
+        generate = input('Invalid choice. Please select one of the two options (1 or 2):')
+    if generate == '1':
+        password = secrets.token_urlsafe(16)
+    else:
+        password = getpass('Password: ')
+
+    comment = _validate_password(password)[1]
+    print(comment)
+    confirm = getpass('Confirm your password: ')
+    hashed = _get_password_hash(password)
+
+    while not _verify_password(confirm, hashed):
+        confirm = getpass('Passwords do not match, please try again: ')
+
+    vault_entry = {
+        "service" : service,
+        "username" : username,
+        "password" : password
+    }
+
+    save = input('Do you want to save this entry to your vault?[y/N]: ')
+    if save == 'y':
+        vault['passwords'].append(vault_entry)
+        vault_string = json.dumps(vault)
+        _encrypt_vault(key, salt, vault_string)
+        print('New password has been added!')
+
+def get_password(args):
+    key, salt, vault = _process_master_password()
+    service_name = getattr(args, 'service', None)
+
+    if not vault['passwords']:
+        print('You have not saved any passwords.')
+        return
+    if args.all and service_name is not None:
+        print('Please either select "-all" to see all your passwords, or "--service" followed by the service you want to see.')
+        return
+
+    if args.all:
+        services_to_show = vault['passwords']
+    else:
+        services_to_show = [entry for entry in vault['passwords'] if service_name.lower() == entry['service']]
+        if not services_to_show:
+            print('No entry found for this service.')
+            return
+
+    for s in services_to_show:
+        for k, v in s.items():
+            print(f'{k} : {v}')
+        print()
+
+
 
 def main():
     parser = argparse.ArgumentParser(description='Password Manager')
@@ -112,13 +189,13 @@ def main():
 
     # ======================== ADD PASSWORD =======================
     add = subparser.add_parser('add', help='Add passwords in your vault')
-    add.set_defaults(func='')
+    add.set_defaults(func=add_password)
 
     # ======================== GET PASSWORD =======================
     get = subparser.add_parser('get', help='Retrieve password from your vault')
-    get.add_argument('--password', type=str, help='Password you want to retrieve')
-    get.add_argument('--all', action='store_true', help='Retrieve all passwords')
-    get.set_defaults(func='')
+    get.add_argument('--service', type=str, help='Password you want to retrieve')
+    get.add_argument('--all', action='store_true', help='Retrieve all passwords (not recommended)')
+    get.set_defaults(func=get_password)
 
     # ======================= LIST SERVICES =======================
     list_all = subparser.add_parser('list', help='List all services stored in your vault')
@@ -153,5 +230,8 @@ def main():
         parser.print_help()
 
 if __name__ == '__main__':
-    # main()
     initialize_vault()
+    add = input('Add password: ').lower()
+    if add == 'y':
+        add_password()
+    get = input('Get password: ').lower()
