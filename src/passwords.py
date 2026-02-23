@@ -196,8 +196,6 @@ def generate(args):
 
     pw = "".join(secrets.choice(alphabet) for _ in range(length))
     print(f"Password: {pw}")
-
-    print(f'Password :{pw}')
     return
 
 def update(args):
@@ -227,7 +225,7 @@ def update(args):
 
     else:
         mock = [p for p in vault['passwords'] if p['service'] != entry]
-        if len(mock) == len(vault['password']):
+        if len(mock) == len(vault['passwords']):
             print('Entry not in the vault.')
             return
         vault['passwords'] = mock
